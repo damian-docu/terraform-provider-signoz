@@ -273,7 +273,7 @@ func (r *alertResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Computed:    true,
 				Description: "State of the alert.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
+					useUnknownOnUpdate{},
 				},
 			},
 			attr.CreateAt: schema.StringAttribute{
@@ -294,14 +294,14 @@ func (r *alertResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Computed:    true,
 				Description: "Last update time of the alert.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
+					useUnknownOnUpdate{},
 				},
 			},
 			attr.UpdateBy: schema.StringAttribute{
 				Computed:    true,
 				Description: "Last updater of the alert.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
+					useUnknownOnUpdate{},
 				},
 			},
 		},
