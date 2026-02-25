@@ -113,10 +113,10 @@ func (r *alertResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				},
 			},
 			attr.BroadcastToAll: schema.BoolAttribute{
-				Optional: true,
-				Computed: true,
-				Description: "Whether to broadcast the alert to all the alerting channels. " +
-					"By default, the alert is only sent to the preferred channels.",
+				Optional:           true,
+				Computed:           true,
+				Default:            booldefault.StaticBool(false),
+				Description:        "Whether to broadcast the alert to all the alerting channels. " + "By default, the alert is only sent to the preferred channels.",
 				DeprecationMessage: "This field is no longer needed and will be ignored",
 			},
 			attr.Condition: schema.StringAttribute{
@@ -211,6 +211,9 @@ func (r *alertResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Optional:    true,
 				Computed:    true,
 				Description: "Notification settings for the alert. Only used when schema_version is v2 or higher.",
+				PlanModifiers: []planmodifier.Object{
+					objectUseStateForUnknownIncludingNull{},
+				},
 				Attributes: map[string]schema.Attribute{
 					attr.Renotify: schema.SingleNestedAttribute{
 						Optional:    true,
@@ -260,6 +263,9 @@ func (r *alertResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Optional:    true,
 				Computed:    true,
 				Description: "Evaluation settings for the alert (JSON). Only used when schema_version is v2 or higher.",
+				PlanModifiers: []planmodifier.String{
+					useStateForUnknownIncludingNull{},
+				},
 			},
 			// computed.
 			attr.ID: schema.StringAttribute{
@@ -273,7 +279,7 @@ func (r *alertResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Computed:    true,
 				Description: "State of the alert.",
 				PlanModifiers: []planmodifier.String{
-					useUnknownOnUpdate{},
+					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
 			attr.CreateAt: schema.StringAttribute{
@@ -294,14 +300,14 @@ func (r *alertResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Computed:    true,
 				Description: "Last update time of the alert.",
 				PlanModifiers: []planmodifier.String{
-					useUnknownOnUpdate{},
+					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
 			attr.UpdateBy: schema.StringAttribute{
 				Computed:    true,
 				Description: "Last updater of the alert.",
 				PlanModifiers: []planmodifier.String{
-					useUnknownOnUpdate{},
+					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
 		},
@@ -456,10 +462,19 @@ func (r *alertResource) Read(ctx context.Context, req resource.ReadRequest, resp
 	state.UpdateBy = types.StringValue(alert.UpdateBy)
 	state.SchemaVersion = types.StringValue(alert.SchemaVersion)
 
-	state.Condition, err = alert.ConditionToTerraform()
-	if err != nil {
-		addErr(&resp.Diagnostics, err, operationRead, SigNozAlert)
-		return
+	// For condition, keep the prior state value when it exists. The SigNoz
+	// API both adds default fields (forDuration, compareOp, formulaQueries)
+	// and strips empty values (groupBy:[], empty strings) from conditions,
+	// making round-trip comparison unreliable. Since all alerts are managed
+	// by Terraform, we trust the config as the source of truth and only
+	// read from the API on initial import (when state is null/unknown).
+	if state.Condition.IsNull() || state.Condition.IsUnknown() {
+		apiCondition, err := alert.ConditionToTerraform()
+		if err != nil {
+			addErr(&resp.Diagnostics, err, operationRead, SigNozAlert)
+			return
+		}
+		state.Condition = apiCondition
 	}
 
 	var diagLabelsRead diag.Diagnostics
@@ -470,6 +485,10 @@ func (r *alertResource) Read(ctx context.Context, req resource.ReadRequest, resp
 	state.PreferredChannels, diagPreferredChannels = alert.PreferredChannelsToTerraform()
 	resp.Diagnostics.Append(diagPreferredChannels...)
 
+	// For evaluation and notification_settings, only update the state if the
+	// API returns meaningful values. When the schema is v1 and these are null
+	// in both prior state and API response, don't touch them to avoid drifting
+	// between null and unknown during plan.
 	if alert.SchemaVersion != "" && alert.SchemaVersion != "v1" {
 		var diagNotifSettings diag.Diagnostics
 		state.NotificationSettings, diagNotifSettings = alert.NotificationSettingsToTerraform(ctx)
@@ -484,9 +503,14 @@ func (r *alertResource) Read(ctx context.Context, req resource.ReadRequest, resp
 			return
 		}
 	} else {
-		state.NotificationSettings = types.ObjectNull(
-			attr.NotificationSettingsAttrTypes())
-		state.Evaluation = types.StringNull()
+		// Only set to null if not already null — avoids unnecessary state churn.
+		if !state.NotificationSettings.IsNull() {
+			state.NotificationSettings = types.ObjectNull(
+				attr.NotificationSettingsAttrTypes())
+		}
+		if !state.Evaluation.IsNull() {
+			state.Evaluation = types.StringNull()
+		}
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
@@ -586,14 +610,17 @@ func (r *alertResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	plan.RuleType = types.StringValue(alert.RuleType)
 	plan.Severity = types.StringValue(alert.Labels[attr.Severity])
 	plan.Source = types.StringValue(alert.Source)
-	plan.State = types.StringValue(alert.State)
+	// Do NOT overwrite State, UpdateAt, UpdateBy from the API response.
+	// These volatile fields use UseStateForUnknown, so the plan value
+	// equals the prior state value. Overwriting with the API response
+	// would cause "inconsistent result after apply" errors because the
+	// API may return different values (e.g., state flips firing/inactive,
+	// update_at gets a new timestamp). The next Read will refresh these.
 	plan.Summary = types.StringValue(alert.Annotations.Summary)
 	plan.Version = types.StringValue(alert.Version)
 	plan.SchemaVersion = types.StringValue(alert.SchemaVersion)
 	plan.CreateAt = types.StringValue(alert.CreateAt)
 	plan.CreateBy = types.StringValue(alert.CreateBy)
-	plan.UpdateAt = types.StringValue(alert.UpdateAt)
-	plan.UpdateBy = types.StringValue(alert.UpdateBy)
 
 	//As condition is JSON string, updated response contains extra keys
 	plan.Condition, err = alertUpdate.ConditionToTerraform()
@@ -610,24 +637,11 @@ func (r *alertResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	plan.PreferredChannels, diagPreferredChannelsUpdate = alert.PreferredChannelsToTerraform()
 	resp.Diagnostics.Append(diagPreferredChannelsUpdate...)
 
-	if alert.SchemaVersion != "" && alert.SchemaVersion != "v1" {
-		var diagNotif diag.Diagnostics
-		plan.NotificationSettings, diagNotif = alert.NotificationSettingsToTerraform(ctx)
-		resp.Diagnostics.Append(diagNotif...)
-		if resp.Diagnostics.HasError() {
-			return
-		}
-
-		plan.Evaluation, err = alert.EvaluationToTerraform()
-		if err != nil {
-			addErr(&resp.Diagnostics, err, operationUpdate, SigNozAlert)
-			return
-		}
-	} else {
-		plan.NotificationSettings = types.ObjectNull(
-			attr.NotificationSettingsAttrTypes())
-		plan.Evaluation = types.StringNull()
-	}
+	// Do NOT overwrite NotificationSettings and Evaluation from the API
+	// response. These use UseStateForUnknown plan modifiers, so the plan
+	// value is the prior state value when the user hasn't configured them.
+	// Overwriting with the API response could cause inconsistency errors
+	// if the API returns normalized or enriched values. Read will refresh.
 
 	// Set refreshed state.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
